@@ -4,5 +4,32 @@ variable "state_bucket"  { type = string }
 variable "lock_table"    { type = string }
 variable "deploy_bucket" { type = string }
 variable "IsDevMode"     { type = bool }
-variable "aws_profile" { type = string, default = null }
+variable "aws_profile" {
+     type = string 
+     default = null
+    }
 
+
+
+variable "vpc_id"            { type = string }
+variable "subnet_id"         { type = string }
+# variable "allow_ssh_cidr"    { type = string  default = "" } # optional
+variable "github_owner"      { type = string }               # org or user
+variable "github_repo"       { type = string }               # repo name (or leave empty if org-level)
+variable "runner_labels"     { 
+    type = list(string) 
+    default = ["self-hosted","terraform-runner"] 
+    }
+variable "ssm_github_pat_name" { type = string }             # e.g. "/ci/github/pat"
+variable "ec2_key_name"      { 
+    type = string  
+    default = null 
+    } # optional if you want SSH
+variable "instance_type"     { 
+    type = string  
+    default = "t2.micro" 
+    }
+variable "ec2_name"          { 
+    type = string  
+    default = "gha-terraform-runner" 
+    }

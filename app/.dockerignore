@@ -1,0 +1,6 @@
+prometheus.*
+*.log
+*.tmp
+*.bak
+*.swp
+docker-compose.*
