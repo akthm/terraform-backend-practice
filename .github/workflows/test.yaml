@@ -1,3 +1,4 @@
+name: Terraform Test
 on: [push, pull_request]
 
 jobs: 
@@ -5,7 +6,10 @@ jobs:
     runs-on: terraform-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with: 
+          sparse-checkout: terraform/infra/**
+
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v2
@@ -13,7 +17,9 @@ jobs:
           terraform_version: 1.7.5
 
       - name: Terraform Init
-        run: terraform init terraform/bootstrap
+        working-directory: ./terraform/infra
+        run: terraform init 
 
       - name: Terraform Validate
-        run: terraform validate terraform/bootstrap
+        working-directory: ./terraform/infra
+        run: terraform validate 
