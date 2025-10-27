@@ -8,13 +8,28 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with: 
-          sparse-checkout: terraform/infra/**
+          sparse-checkout: terraform/infra
 
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v2
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.7.5
+
+      - name: debug working directory
+        run: pwd
+        working-directory: ./terraform/infra
+        shell: bash
+        
+      - name: debug working directory
+        run: ls -la
+        working-directory: ./terraform/infra
+        shell: bash
+
+
+      - name: Terraform Format Check
+        working-directory: ./terraform/infra
+        run: terraform fmt -check
 
       - name: Terraform Init
         working-directory: ./terraform/infra
