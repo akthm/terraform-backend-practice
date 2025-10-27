@@ -10,6 +10,13 @@ jobs:
         with: 
           sparse-checkout: terraform/infra
 
+      - name: Install Node.js
+        run: |
+          apt-get update
+          apt-get install -y curl
+          curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+          apt-get install -y nodejs
+
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
@@ -20,7 +27,7 @@ jobs:
         run: pwd
         working-directory: ./terraform/infra
         shell: bash
-        
+
       - name: debug working directory
         run: ls -la
         working-directory: ./terraform/infra
