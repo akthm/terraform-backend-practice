@@ -1,0 +1,19 @@
+on: [push, pull_request]
+
+jobs: 
+  test:
+    runs-on: terraform-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.7.5
+
+      - name: Terraform Init
+        run: terraform init terraform/bootstrap
+
+      - name: Terraform Validate
+        run: terraform validate terraform/bootstrap

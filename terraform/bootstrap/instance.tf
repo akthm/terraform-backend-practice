@@ -37,11 +37,11 @@ resource "aws_iam_role_policy_attachment" "ssm_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# (Optional) CloudWatch agent for logs (attach if you push logs)
-# resource "aws_iam_role_policy_attachment" "cw_agent" {
-#   role       = aws_iam_role.runner_role.name
-#   policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-# }
+#  CloudWatch agent for logs (attach if you push logs)
+resource "aws_iam_role_policy_attachment" "cw_agent" {
+  role       = aws_iam_role.runner_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
 
 # Least-priv for reading the GitHub PAT from SSM Parameter Store (SecureString)
 data "aws_iam_policy_document" "ssm_read_pat" {
@@ -86,7 +86,8 @@ resource "aws_iam_instance_profile" "runner_profile" {
 resource "aws_security_group" "runner_sg" {
   name        = "${var.ec2_name}-sg"
   description = "Minimal SG for self-hosted GitHub Actions runner"
-  vpc_id      = var.vpc_id
+  vpc_id      = aws_vpc.main.id
+
 
   # SSM requires no inbound (it uses the agent outbound). Keep inbound closed.
 #   dynamic "ingress" {
@@ -112,200 +113,64 @@ resource "aws_security_group" "runner_sg" {
 }
 
 
-data "template_cloudinit_config" "runner_userdata" {
+# --- Render bootstrap with templatefile() ---
+# 1) A small cloud-config to install packages and call the script
+locals {
+  cloud_config = <<-YAML
+    #cloud-config
+    package_update: true
+    package_upgrade: true
+    packages:
+      - unzip
+      - jq
+      - curl
+      - ca-certificates
+      - gnupg
+      - apt-transport-https
+    runcmd:
+      - [ bash, -lc, "/usr/local/bin/gha-bootstrap.sh" ]
+  YAML
+}
+
+# 2) The actual shell script content, rendered with Terraform variables
+locals {
+  gha_bootstrap = templatefile("${path.module}/files/gha-bootstrap.sh.tftpl", {
+    github_owner        = var.github_owner
+    github_repo         = var.github_repo
+    repo_or_org_path    = local.repo_or_org_path
+    runner_labels_csv   = local.runner_labels_csv
+    ssm_github_pat_name = var.ssm_github_pat_name
+    cw_log_group        = var.cw_log_group
+  })
+}
+
+# 3) Combine both parts into proper cloud-init MIME
+data "template_cloudinit_config" "gha_bootstrap" {
   gzip          = true
   base64_encode = true
 
   part {
-    filename     = "cloud-config.txt"
     content_type = "text/cloud-config"
-    content = <<-CLOUDCFG
-      #cloud-config
-      package_update: true
-      package_upgrade: true
-      packages:
-        - git
-        - unzip
-        - jq
-        - curl
-        - apt-transport-https
-        - ca-certificates
-        - gnupg
-      runcmd:
-        - [ bash, -lc, "/usr/local/bin/runner-bootstrap.sh" ]
-    CLOUDCFG
+    content      = local.cloud_config
   }
 
   part {
-    filename     = "runner-bootstrap.sh"
+    filename     = "gha-bootstrap.sh"
     content_type = "text/x-shellscript"
-    content = <<-BOOTSTRAP
-      #!/usr/bin/env bash
-      set -Eeuo pipefail
-
-      GH_OWNER="${var.github_owner}"
-      GH_REPO="${var.github_repo}"          # empty means org-level
-      REPO_OR_ORG_PATH="${local.repo_or_org_path}"
-      LABELS="${local.runner_labels_csv}"
-      SSM_GH_PAT_PARAM="${var.ssm_github_pat_name}"
-
-      LOG_DIR="/var/log/gha"
-      RUNNER_DIR="/opt/actions-runner"
-      UNIT_NAME="gha-runner.service"
-
-      mkdir -p "$LOG_DIR"
-      exec > >(tee -a "$LOG_DIR/bootstrap.log") 2>&1
-
-      echo "[*] Installing AWS CLI v2 (if missing)…"
-      if ! command -v aws >/dev/null 2>&1; then
-        tmpd=$(mktemp -d)
-        pushd "$tmpd"
-        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-        unzip -q awscliv2.zip
-        ./aws/install
-        popd
-        rm -rf "$tmpd"
-      fi
-
-      echo "[*] Install Docker (used by many workflows)…"
-      if ! command -v docker >/dev/null 2>&1; then
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        chmod a+r /etc/apt/keyrings/docker.gpg
-        echo \
-          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-          $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
-          | tee /etc/apt/sources.list.d/docker.list > /dev/null
-        apt-get update -y
-        apt-get install -y docker-ce docker-ce-cli containerd.io
-        usermod -aG docker ubuntu || true
-        systemctl enable --now docker
-      fi
-
-      echo "[*] Fetching GitHub PAT from SSM…"
-      GH_PAT=$(aws ssm get-parameter --name "$SSM_GH_PAT_PARAM" --with-decryption --query 'Parameter.Value' --output text)
-
-      echo "[*] Getting registration token from GitHub API…"
-      REG_TOKEN=$(curl -fsSL -X POST \
-        -H "Authorization: token $${GH_PAT}" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/$${REPO_OR_ORG_PATH}/actions/runners/registration-token" \
-        | jq -r .token)
-
-      echo "[*] Install latest GitHub Actions runner…"
-      mkdir -p "$RUNNER_DIR"
-      cd "$RUNNER_DIR"
-      # get latest release tag
-      RUNNER_VERSION=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')
-      curl -fsSL -o actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz \
-        https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz
-      tar xzf actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz
-      chown -R ubuntu:ubuntu "$RUNNER_DIR"
-
-      echo "[*] Create systemd unit…"
-      cat >/etc/systemd/system/$${UNIT_NAME} <<'UNIT'
-      [Unit]
-      Description=GitHub Actions Runner (ephemeral)
-      After=network-online.target
-      Wants=network-online.target
-
-      [Service]
-      Type=simple
-      WorkingDirectory=/opt/actions-runner
-      Environment="GH_OWNER=$${GH_OWNER}"
-      Environment="GH_REPO=$${GH_REPO}"
-      Environment="REPO_OR_ORG_PATH=$${REPO_OR_ORG_PATH}"
-      Environment="SSM_GH_PAT_PARAM=$${SSM_GH_PAT_PARAM}"
-      Environment="LABELS=$${LABELS}"
-      ExecStart=/usr/local/bin/runner-loop.sh
-      ExecStop=/usr/local/bin/runner-stop.sh
-      Restart=always
-      RestartSec=5
-
-      [Install]
-      WantedBy=multi-user.target
-      UNIT
-
-      echo "[*] Create runner loop script (ephemeral, auto re-register)…"
-      cat >/usr/local/bin/runner-loop.sh <<'LOOP'
-      #!/usr/bin/env bash
-      set -Eeuo pipefail
-
-      LOG_DIR="/var/log/gha"
-      RUNNER_DIR="/opt/actions-runner"
-
-      while true; do
-        echo "[*] Refresh GH PAT + registration token…"
-        GH_PAT=$(aws ssm get-parameter --name "$${SSM_GH_PAT_PARAM}" --with-decryption --query 'Parameter.Value' --output text)
-        REG_TOKEN=$(curl -fsSL -X POST \
-          -H "Authorization: token $${GH_PAT}" \
-          -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/$${REPO_OR_ORG_PATH}/actions/runners/registration-token" \
-          | jq -r .token)
-
-        cd "$RUNNER_DIR"
-        # remove old config if exists (ephemeral run cleans up, but be safe)
-        ./config.sh remove --token "$${REG_TOKEN}" >/dev/null 2>&1 || true
-
-        if [[ -n "$${GH_REPO}" ]]; then
-          URL="https://github.com/$${GH_OWNER}/$${GH_REPO}"
-        else
-          URL="https://github.com/$${GH_OWNER}"
-        fi
-
-        ./config.sh \
-          --url "$${URL}" \
-          --token "$${REG_TOKEN}" \
-          --name "$(hostname)-$(date +%s)" \
-          --labels "$${LABELS}" \
-          --unattended \
-          --ephemeral
-
-        echo "[*] Starting runner once (ephemeral)…"
-        ./run.sh >> "$${LOG_DIR}/runner.log" 2>&1 || true
-
-        echo "[*] Runner finished a job or crashed; reconfiguring in 5s…"
-        sleep 5
-      done
-      LOOP
-      chmod +x /usr/local/bin/runner-loop.sh
-
-      echo "[*] Create stop script to deregister on shutdown…"
-      cat >/usr/local/bin/runner-stop.sh <<'STOP'
-      #!/usr/bin/env bash
-      set -Eeuo pipefail
-      RUNNER_DIR="/opt/actions-runner"
-      # Best-effort deregister
-      if [[ -x "$${RUNNER_DIR}/config.sh" ]]; then
-        GH_PAT=$(aws ssm get-parameter --name "$${SSM_GH_PAT_PARAM}" --with-decryption --query 'Parameter.Value' --output text)
-        REG_TOKEN=$(curl -fsSL -X POST \
-          -H "Authorization: token $${GH_PAT}" \
-          -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/$${REPO_OR_ORG_PATH}/actions/runners/registration-token" \
-          | jq -r .token)
-        "$${RUNNER_DIR}/config.sh" remove --unattended --token "$${REG_TOKEN}" || true
-      fi
-      STOP
-      chmod +x /usr/local/bin/runner-stop.sh
-
-      echo "[*] Enable & start runner service…"
-      systemctl daemon-reload
-      systemctl enable --now $${UNIT_NAME}
-      echo "[*] Bootstrap complete."
-    BOOTSTRAP
+    content      = local.gha_bootstrap
   }
 }
 
 resource "aws_instance" "gha_runner" {
   ami                         = data.aws_ami.ubuntu_22.id
   instance_type               = var.instance_type
-  subnet_id                   = var.subnet_id
+  subnet_id                   = aws_subnet.public_1.id
   vpc_security_group_ids      = [aws_security_group.runner_sg.id]
   iam_instance_profile        = aws_iam_instance_profile.runner_profile.name
-  key_name                    = var.ec2_key_name # optional
+#   key_name                    = var.ec2_key_name # optional
   associate_public_ip_address = true
 
-  user_data_base64 = data.template_cloudinit_config.runner_userdata.rendered
+  user_data_base64 = data.template_cloudinit_config.gha_bootstrap.rendered
 
   tags = {
     Name = var.ec2_name

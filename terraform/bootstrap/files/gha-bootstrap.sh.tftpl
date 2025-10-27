@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOG_DIR="/var/log/gha"
+RUNNER_DIR="/opt/actions-runner"
+UNIT_NAME="gha-runner.service"
+CW_LOG_GROUP="${cw_log_group}"
+
+mkdir -p "$LOG_DIR"
+chown ubuntu:ubuntu "$LOG_DIR"
+exec > >(tee -a "$LOG_DIR/bootstrap.log") 2>&1
+
+echo "[*] Write /etc/gha.env (values injected by Terraform)…"
+cat >/etc/gha.env <<ENV
+GH_OWNER=${github_owner}
+GH_REPO=${github_repo}
+REPO_OR_ORG_PATH=${repo_or_org_path}
+SSM_GH_PAT_PARAM=${ssm_github_pat_name}
+LABELS=${runner_labels_csv}
+ENV
+chmod 0644 /etc/gha.env
+
+echo "[*] Ensure AWS CLI v2…"
+if ! command -v aws >/dev/null 2>&1; then
+  tmpd=$(mktemp -d)
+  pushd "$tmpd"
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+  unzip -q awscliv2.zip
+  ./aws/install
+  popd
+  rm -rf "$tmpd"
+fi
+
+echo "[*] Install Docker…"
+if ! command -v docker >/dev/null 2>&1; then
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+    | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io
+  usermod -aG docker ubuntu || true
+  systemctl enable --now docker
+fi
+
+echo "[*] Install latest GitHub Actions runner…"
+mkdir -p "$RUNNER_DIR"
+cd "$RUNNER_DIR"
+RUNNER_VERSION=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')
+curl -fsSL -o actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz \
+  https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz
+tar xzf actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz
+chown -R ubuntu:ubuntu "$RUNNER_DIR"
+
+echo "[*] Create systemd unit…"
+cat >/etc/systemd/system/$${UNIT_NAME} <<'UNIT'
+[Unit]
+Description=GitHub Actions Runner (ephemeral)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/actions-runner
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/gha.env
+ExecStart=/usr/local/bin/runner-loop.sh
+ExecStop=/usr/local/bin/runner-stop.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/gha/gha-runner.service.log #FallbackLog
+StandardError=append:/var/log/gha/gha-runner.service.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+echo "[*] Create runner loop script…"
+cat >/usr/local/bin/runner-loop.sh <<'LOOP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOG_DIR="/var/log/gha"
+RUNNER_DIR="/opt/actions-runner"
+
+while true; do
+  echo "[*] Refresh GH PAT + registration token…" | tee -a "$LOG_DIR/runner.log"
+  GH_PAT=$(aws ssm get-parameter --name "${ssm_github_pat_name}" --with-decryption --query 'Parameter.Value' --output text)
+  REG_TOKEN=$(curl -fsSL -X POST \
+    -H "Authorization: Bearer $${GH_PAT}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/${repo_or_org_path}/actions/runners/registration-token" \
+    | jq -r .token)
+
+  cd "$RUNNER_DIR"
+  ./config.sh remove --token "$${REG_TOKEN}" >/dev/null 2>&1 || true
+
+  if [[ -n "${github_repo}" ]]; then
+    URL="https://github.com/${github_owner}/${github_repo}"
+  else
+    URL="https://github.com/${github_owner}"
+  fi
+
+  ./config.sh \
+    --url "$${URL}" \
+    --token "$${REG_TOKEN}" \
+    --name "$(hostname)-$(date +%s)" \
+    --labels "$${LABELS}" \
+    --unattended \
+    --ephemeral
+
+  echo "[*] Runner listening…" | tee -a "$LOG_DIR/runner.log"
+  ./run.sh >> "$LOG_DIR/runner.log" 2>&1 || true
+  echo "[*] Runner finished; re-registering in 5s…" | tee -a "$LOG_DIR/runner.log"
+  sleep 5
+done
+LOOP
+chmod +x /usr/local/bin/runner-loop.sh
+
+echo "[*] Create stop script…"
+cat >/usr/local/bin/runner-stop.sh <<'STOP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+RUNNER_DIR="/opt/actions-runner"
+if [[ -x "$${RUNNER_DIR}/config.sh" ]]; then
+  GH_PAT=$(aws ssm get-parameter --name "${ssm_github_pat_name}" --with-decryption --query 'Parameter.Value' --output text)
+  REG_TOKEN=$(curl -fsSL -X POST \
+    -H "Authorization: Bearer $${GH_PAT}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/${repo_or_org_path}/actions/runners/registration-token" \
+    | jq -r .token)
+  "$${RUNNER_DIR}/config.sh" remove --unattended --token "$${REG_TOKEN}" || true
+fi
+STOP
+chmod +x /usr/local/bin/runner-stop.sh
+
+echo "[*] Install CloudWatch Agent…"
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+tmpd=$(mktemp -d)
+pushd "$tmpd"
+curl -fsSL -o amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+dpkg -i amazon-cloudwatch-agent.deb
+popd
+rm -rf "$tmpd"
+
+# Discover region for the agent via IMDSv2
+TOKEN=$(curl -fsSL -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+REGION=$(curl -fsSL -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+
+echo "[*] Write CloudWatch Agent config…"
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          { "file_path": "/var/log/gha/bootstrap.log",       "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/bootstrap" },
+          { "file_path": "/var/log/gha/runner.log",          "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/runner" },
+          { "file_path": "/var/log/cloud-init-output.log",   "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/cloud-init" }
+        ]
+      }
+    },
+    "force_flush_interval": 5
+  },
+  "agent": { "region": "$${REGION}", "debug": false }
+}
+CWCFG
+
+echo "[*] Enable & start services…"
+systemctl daemon-reload
+systemctl enable --now $${UNIT_NAME}
+
+echo "[*] Validating CloudWatch Agent config File"
+
+sudo jq . /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+echo "[*] Bootstrap complete."
