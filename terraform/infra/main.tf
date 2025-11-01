@@ -18,7 +18,7 @@ resource "aws_ssm_parameter" "hello" {
 # Another safe resource
 resource "aws_cloudwatch_log_group" "hello" {
   name              = "/hello/runner"
-  retention_in_days = 7
+  retention_in_days = 1
   tags = merge(var.tags, {
     "Component" : "hello-log"
   })

@@ -67,7 +67,7 @@ data "aws_iam_policy_document" "ssm_read_pat" {
     actions = ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"]
     resources = [
       aws_s3_bucket.tf_state.arn,
-      "${aws_s3_bucket.tf_state.arn}/${var.state_key_prefix}"
+      "${aws_s3_bucket.tf_state.arn}/${var.state_key_prefix}/*"
     ]
   }
 
