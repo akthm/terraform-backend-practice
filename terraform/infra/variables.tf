@@ -19,7 +19,7 @@ variable "ssm_parameter_name" {
 variable "tags" {
   type        = map(string)
   description = "Extra tags merged into resources"
-  default     = {
+  default = {
     ManagedBy = "Terraform"
     Project   = "tf-hello-runner"
   }

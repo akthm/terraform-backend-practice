@@ -9,11 +9,11 @@ data "aws_region" "current" {}
 
 # A super-safe resource to create in any account
 resource "aws_ssm_parameter" "hello" {
-  name        = var.ssm_parameter_name       # e.g., "/hello/runner"
+  name        = var.ssm_parameter_name # e.g., "/hello/runner"
   description = "Hello from the EC2 GH Actions runner"
   type        = "String"
   value       = "deployed-by-github-actions"
-  tags        = merge(var.tags, {
+  tags = merge(var.tags, {
     "Component" : "hello-ssm"
   })
 }
@@ -22,7 +22,7 @@ resource "aws_ssm_parameter" "hello" {
 resource "aws_cloudwatch_log_group" "hello" {
   name              = "/hello/runner"
   retention_in_days = 7
-  tags              = merge(var.tags, {
+  tags = merge(var.tags, {
     "Component" : "hello-log"
   })
 }
