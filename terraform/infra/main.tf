@@ -1,7 +1,4 @@
-provider "aws" {
-  # Terraform will auto-pick credentials from the runner's instance role
-  region = var.aws_region
-}
+
 
 # Useful identity/region data—great for tags and outputs
 data "aws_caller_identity" "current" {}
