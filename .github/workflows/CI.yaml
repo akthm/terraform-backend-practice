@@ -11,7 +11,7 @@ on:
 
 
 jobs:
-  plan:
+  plan and apply:
     runs-on: [self-hosted]   # or [self-hosted, ec2] if you use a custom label
     defaults:
       run:
@@ -45,22 +45,11 @@ jobs:
         run: terraform validate -no-color
 
       - name: Terraform Plan
-        run: terraform plan -input=false -no-color
-
-  apply:
-    needs: plan
-    runs-on: [self-hosted]
-    environment: nonprod      # add a required approval on this environment in GitHub
-    steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Terraform Init (S3+DDB backend)
-        run: terraform init -backend-config=backend.hcl
+        run: terraform plan -input=false -no-color -out=tfplan
 
       - name: Terraform Apply
-        run: terraform apply -auto-approve -input=false
+        run: terraform apply -auto-approve -input=false tfplan
+
+      - name: Cleanup tfplan file
+        if: always()                   
+        run: rm -f tfplan 
