@@ -8,13 +8,19 @@ on:
     branches: [ main ]
     paths: [ "terraform/infra/*.tf", "backend.hcl" ]
   workflow_dispatch:
-  
+
 
 jobs:
   plan:
     runs-on: [self-hosted]   # or [self-hosted, ec2] if you use a custom label
+    defaults:
+      run:
+        working-directory: terraform/infra
     steps:
       - uses: actions/checkout@v4
+        with:
+          sparse-checkout: terraform/infra/
+          sparse-checkout-cone: true
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
