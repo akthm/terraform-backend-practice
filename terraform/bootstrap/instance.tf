@@ -71,11 +71,11 @@ data "aws_iam_policy_document" "ssm_read_pat" {
     ]
   }
 
-  statement {
-    sid     = "LockTable"
-    actions = ["dynamodb:GetItem","dynamodb:PutItem","dynamodb:DeleteItem","dynamodb:DescribeTable","dynamodb:UpdateItem"]
-    resources = [aws_dynamodb_table.tf_lock.arn]
-  }
+  # statement {
+  #   sid     = "LockTable"
+  #   actions = ["dynamodb:GetItem","dynamodb:PutItem","dynamodb:DeleteItem","dynamodb:DescribeTable","dynamodb:UpdateItem"]
+  #   resources = [aws_dynamodb_table.tf_lock.arn]
+  # }
 }
 
 resource "aws_iam_policy" "ssm_read_pat" {
