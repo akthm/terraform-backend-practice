@@ -48,7 +48,7 @@ jobs:
         run: terraform plan -input=false -no-color
 
   apply:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main || github.event_name == 'workflow_dispatch'
     needs: plan
     runs-on: [self-hosted]
     environment: nonprod      # add a required approval on this environment in GitHub
