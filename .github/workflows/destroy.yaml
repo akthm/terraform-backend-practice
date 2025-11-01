@@ -1,0 +1,85 @@
+# .github/workflows/destroy.yaml
+name: Terraform Destroy (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      path:
+        description: "Path to the stack (folder with .tf or terragrunt.hcl)"
+        required: true
+        default: "accounts/nonprod/eu-west-1/project-a/dev/app"
+      confirm:
+        description: 'Type: I UNDERSTAND THIS WILL DESTROY'
+        required: true
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-latest
+    outputs:
+      path: ${{ steps.out.outputs.path }}
+    steps:
+      - id: out
+        run: echo "path=${{ github.event.inputs.path }}" >> "$GITHUB_OUTPUT"
+
+      # 1) Require exact confirmation phrase
+      - name: Require confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "I UNDERSTAND THIS WILL DESTROY" ]; then
+            echo "Incorrect confirmation text."; exit 1; fi
+
+      # 2) Disallow prod by default (simple path guard)
+      - name: Block prod by default
+        run: |
+          case "${{ github.event.inputs.path }}" in
+            *"/prod/"* ) echo "Prod destroys are blocked. Contact platform team."; exit 1;;
+            * ) echo "Non-prod path OK.";;
+          esac
+
+  plan_destroy:
+    needs: guardrails
+    runs-on: self-hosted   # your EC2 runner
+    environment: nonprod   # add required reviewers in GitHub Environments
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Init
+        working-directory: ${{ needs.guardrails.outputs.path }}
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Show state location (sanity)
+        working-directory: ${{ needs.guardrails.outputs.path }}
+        run: terraform state list || echo "(state empty)"
+
+      - name: Plan (destroy)
+        working-directory: ${{ needs.guardrails.outputs.path }}
+        run: terraform plan -destroy -no-color -input=false
+
+  destroy_apply:
+    needs: plan_destroy
+    runs-on: self-hosted
+    environment: nonprod   # second approval gate recommended
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      # Optional: Assume a stricter "destroy role" via OIDC/STS before running
+      # - name: Configure AWS creds via OIDC
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/terraform-destroy
+      #     aws-region: eu-west-1
+
+      - name: Init
+        working-directory: ${{ github.event.inputs.path }}
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Backup remote state (safety)
+        working-directory: ${{ github.event.inputs.path }}
+        run: |
+          mkdir -p .artifacts
+          terraform state pull > .artifacts/state-$(date +%Y%m%d-%H%M%S).json || true
+
+      - name: Destroy (non-interactive)
+        working-directory: ${{ github.event.inputs.path }}
+        run: terraform destroy -auto-approve -input=false

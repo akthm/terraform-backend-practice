@@ -1,0 +1,51 @@
+name: Terraform CI
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ "terraform/infra/*.tf", "backend.hcl" ]
+  pull_request:
+    branches: [ main ]
+    paths: [ "terraform/infra/*.tf", "backend.hcl" ]
+
+jobs:
+  plan:
+    runs-on: [self-hosted]   # or [self-hosted, ec2] if you use a custom label
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+       # Formatting guard (fails PR if files need reformatting)
+      - name: Terraform Format (check)
+        run: terraform fmt -check -recursive
+
+      #  show the diff for debugging if fmt check fails
+      - name: Terraform Format (diff)
+        if: failure()                   # only runs if the previous step failed
+        run: terraform fmt -diff -recursive
+
+      - name: Terraform Init (S3+DDB backend)
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -no-color
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: plan
+    runs-on: [self-hosted]
+    environment: nonprod      # add a required approval on this environment in GitHub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init (S3+DDB backend)
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false
