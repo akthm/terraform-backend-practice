@@ -11,7 +11,7 @@ on:
 
 
 jobs:
-  plan and apply:
+  plan_apply:
     runs-on: [self-hosted]   # or [self-hosted, ec2] if you use a custom label
     defaults:
       run:
@@ -48,7 +48,7 @@ jobs:
         run: terraform plan -input=false -no-color -out=tfplan
 
       - name: Terraform Apply
-        run: terraform apply -auto-approve -input=false tfplan
+        run: terraform apply tfplan
 
       - name: Cleanup tfplan file
         if: always()                   
