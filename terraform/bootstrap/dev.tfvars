@@ -16,3 +16,4 @@ instance_type="t3.micro"
 ec2_name="gha-terraform-runner-dev"
 runner_labels=["self-hosted","terraform-runner","dev", "terraform-runner-dev"]
 cw_log_group="/gha/runner"
+state_key_prefix="terraform/infra/"

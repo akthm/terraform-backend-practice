@@ -29,8 +29,8 @@ locals {
   base_tags = merge({
     Environment = var.environment
     DeployedBy  = "github-actions"
-    AccountId   = data.aws_caller_identity.current.account_id
-    Region      = data.aws_region.current.name
+    # AccountId   = data.aws_caller_identity.current.account_id
+    # Region      = data.aws_region.current.name
   }, var.tags)
 }
 

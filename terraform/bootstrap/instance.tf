@@ -29,6 +29,15 @@ data "aws_iam_policy_document" "runner_ec2_trust" {
         identifiers = ["ec2.amazonaws.com"] 
         }
   }
+
+   
+
+  # statement {
+  #   sid     = "UseKmsForState"
+  #   actions = ["kms:Encrypt","kms:Decrypt","kms:ReEncrypt*","kms:GenerateDataKey*","kms:DescribeKey"]
+  #   resources = [aws_kms_key.tf_state.arn]
+  # }
+
 }
 
 # Attach SSM core so you can manage without SSH
@@ -52,6 +61,20 @@ data "aws_iam_policy_document" "ssm_read_pat" {
       # if the parameter is KMS-encrypted with a CMK, grant kms:Decrypt for that CMK
       "*"
     ]
+  }
+   statement {
+    sid     = "BackendState"
+    actions = ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"]
+    resources = [
+      aws_s3_bucket.tf_state.arn,
+      "${aws_s3_bucket.tf_state.arn}/${var.state_key_prefix}"
+    ]
+  }
+
+  statement {
+    sid     = "LockTable"
+    actions = ["dynamodb:GetItem","dynamodb:PutItem","dynamodb:DeleteItem","dynamodb:DescribeTable","dynamodb:UpdateItem"]
+    resources = [aws_dynamodb_table.tf_lock.arn]
   }
 }
 

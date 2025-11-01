@@ -47,3 +47,7 @@ variable "cw_log_group"      {
     type = string   
     }
 
+variable "state_key_prefix" {
+  description = "Prefix inside the state bucket to allow (use * for all, or e.g., terraform/infra/)"
+  type        = string
+}
