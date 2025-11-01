@@ -16,6 +16,10 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+    
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
        # Formatting guard (fails PR if files need reformatting)
       - name: Terraform Format (check)
