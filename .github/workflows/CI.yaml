@@ -16,6 +16,8 @@ jobs:
     defaults:
       run:
         working-directory: terraform/infra
+    env:
+      DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,68 +31,19 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Debug AWS identity & perms
+      - name: Add deployment tags to Terraform config
         run: |
+          cat >> terraform.tfvars <<EOF
           
-          set -euo pipefail
-          echo "=== Identity ==="
-          aws sts get-caller-identity
-
-          echo "=== Node & TF versions (sanity) ==="
-          node -v || true
-          terraform -version
-
-          BUCKET="akthmbucketdevterraform"
-          PREFIX="terraform/infra"
-          STATE_ARN="arn:aws:s3:::${BUCKET}/${PREFIX}/terraform.tfstate"
-          LOCK_ARN="${STATE_ARN}.tflock"
-
-          echo "=== Bucket policy (if any) ==="
-          aws s3api get-bucket-policy --bucket "$BUCKET" --query Policy --output text || echo "(no bucket policy)"
-
-          echo "=== KMS aliases (handy if bucket enforces KMS) ==="
-          aws kms list-aliases --output table || true
-
-          echo "=== IAM: list attached & inline policies of this role (best effort) ==="
-          ROLE_NAME="$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/ | head -n1 || true)"
-          if [ -n "$ROLE_NAME" ]; then
-            aws iam list-attached-role-policies --role-name "$ROLE_NAME" || true
-            aws iam list-role-policies --role-name "$ROLE_NAME" || true
-          else
-            echo "(Not on EC2 with instance profile; skipping role introspection)"
-          fi
-
-          echo "=== IAM policy simulation for S3 ==="
-          # You may need iam:SimulatePrincipalPolicy on this role for the lines below.
-          ROLE_ARN=$(aws sts get-caller-identity --query Arn --output text | sed 's/:assumed-role\//:role\//; s,/.*$,,' )
-          echo "Simulating for principal: $ROLE_ARN"
-
-          # Simulate bucket-level and object-level actions
-          aws iam simulate-principal-policy \
-            --policy-source-arn "$ROLE_ARN" \
-            --action-names s3:GetBucketLocation s3:ListBucket \
-            --resource-arns "arn:aws:s3:::${BUCKET}" \
-            --context-entries ContextKeyName=s3:prefix,ContextKeyValues="${PREFIX}/*",ContextKeyType=string \
-            --output table || true
-
-          # Simulate object puts (state + lockfile) WITHOUT KMS header
-          aws iam simulate-principal-policy \
-            --policy-source-arn "$ROLE_ARN" \
-            --action-names s3:PutObject s3:GetObject s3:DeleteObject \
-            --resource-arns "$STATE_ARN" "$LOCK_ARN" \
-            --output table || true
-
-          # Simulate object puts WITH SSE-KMS header (if bucket enforces it)
-          # Replace the key ARN if using a CMK
-          KMS_KEY_ARN="arn:aws:kms:ap-south-1:078681887236:key/REPLACE-ME"
-          aws iam simulate-principal-policy \
-            --policy-source-arn "$ROLE_ARN" \
-            --action-names s3:PutObject \
-            --resource-arns "$STATE_ARN" "$LOCK_ARN" \
-            --context-entries \
-              ContextKeyName=s3:x-amz-server-side-encryption,ContextKeyValues=aws:kms,ContextKeyType=string \
-              ContextKeyName=s3:x-amz-server-side-encryption-aws-kms-key-id,ContextKeyValues="$KMS_KEY_ARN",ContextKeyType=string \
-            --output table || true
+          # Auto-injected deployment tracking tags
+          common_tags = {
+            DeploymentID    = "${{ env.DEPLOYMENT_ID }}"
+            GitHubRunID     = "${{ github.run_id }}"
+            GitHubSHA       = "${{ github.sha }}"
+            ManagedBy       = "Terraform-CI"
+            AutoDestroy     = "true"
+          }
+          EOF
 
        # Formatting guard (fails PR if files need reformatting)
       - name: Terraform Format (check)
@@ -111,7 +64,67 @@ jobs:
         run: terraform plan -input=false -no-color -out=tfplan
 
       - name: Terraform Apply
+        id: apply
         run: terraform apply tfplan
+        continue-on-error: true # for cleanup step
+
+      - name: Detect Apply Failure
+        if: steps.apply.outcome == 'failure'
+        run: |
+          echo "::error::Terraform apply failed! Initiating rollback..."
+          echo "APPLY_FAILED=true" >> $GITHUB_ENV
+      
+      - name: Emergency Destroy on Failure
+        if: env.APPLY_FAILED == 'true'
+        id: emergency_destroy
+        run: |
+          echo "::warning::Rolling back infrastructure from failed deployment"
+          echo "::warning::Deployment ID: ${{ env.DEPLOYMENT_ID }}"
+          
+          # Attempt destroy with detailed logging
+          terraform destroy -auto-approve \
+            -var="deployment_id=${{ env.DEPLOYMENT_ID }}" \
+            2>&1 | tee destroy.log
+          
+          DESTROY_EXIT_CODE=${PIPESTATUS[0]}
+          
+          if [ $DESTROY_EXIT_CODE -eq 0 ]; then
+            echo "::notice::Successfully destroyed partially created infrastructure"
+          else
+            echo "::error::Destroy failed! Manual cleanup may be required"
+            echo "DESTROY_FAILED=true" >> $GITHUB_ENV
+          fi
+          
+          exit $DESTROY_EXIT_CODE
+        working-directory: ./terraform
+        continue-on-error: true
+
+      - name: Fallback AWS Resource Cleanup
+        if: env.DESTROY_FAILED == 'true'
+        run: |
+          echo "::warning::Attempting tag-based resource cleanup"
+          
+          # This script finds and terminates resources with our deployment tags
+          bash scripts/emergency-cleanup.sh "${{ env.DEPLOYMENT_ID }}"
+        continue-on-error: true
+      
+      - name: Report Status
+        if: always()
+        run: |
+          if [ "${{ steps.apply.outcome }}" == "success" ]; then
+            echo "::notice::✅ Terraform apply completed successfully"
+          elif [ "${{ env.APPLY_FAILED }}" == "true" ] && [ "${{ steps.emergency_destroy.outcome }}" == "success" ]; then
+            echo "::warning::⚠️ Apply failed but rollback succeeded - no resources left behind"
+          else
+            echo "::error::❌ Apply failed and rollback may be incomplete - manual review required"
+            exit 1
+          fi
+
+      - name: Final Status Check
+        if: env.APPLY_FAILED == 'true'
+        run: |
+          echo "::error::Deployment failed. Infrastructure has been rolled back."
+          exit 1
 
       - name: Cleanup tfplan file
         if: always()                   

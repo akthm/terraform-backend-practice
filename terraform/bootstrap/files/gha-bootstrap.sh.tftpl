@@ -138,37 +138,241 @@ fi
 STOP
 chmod +x /usr/local/bin/runner-stop.sh
 
-echo "[*] Install CloudWatch Agent…"
-mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
-tmpd=$(mktemp -d)
-pushd "$tmpd"
-curl -fsSL -o amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-dpkg -i amazon-cloudwatch-agent.deb
-popd
-rm -rf "$tmpd"
+# echo "[*] Install CloudWatch Agent…"
+# mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+# tmpd=$(mktemp -d)
+# pushd "$tmpd"
+# curl -fsSL -o amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+# dpkg -i amazon-cloudwatch-agent.deb
+# popd
+# rm -rf "$tmpd"
 
-# Discover region for the agent via IMDSv2
+# # Discover region for the agent via IMDSv2
+# TOKEN=$(curl -fsSL -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+# REGION=$(curl -fsSL -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+
+# echo "[*] Write CloudWatch Agent config…"
+# cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
+# {
+#   "logs": {
+#     "logs_collected": {
+#       "files": {
+#         "collect_list": [
+#           { "file_path": "/var/log/gha/bootstrap.log",       "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/bootstrap" },
+#           { "file_path": "/var/log/gha/runner.log",          "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/runner" },
+#           { "file_path": "/var/log/cloud-init-output.log",   "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/cloud-init" }
+#         ]
+#       }
+#     },
+#     "force_flush_interval": 5
+#   },
+#   "agent": { "region": "$${REGION}", "debug": false }
+# }
+# CWCFG
+
+# ============================================================================
+# FLUENT BIT INSTALLATION & CONFIGURATION
+# ============================================================================
+# Fluent Bit is a lightweight log processor that ships logs to CloudWatch
+# with much lower latency (~2-5 seconds) compared to CloudWatch Agent (~3 minutes)
+# 
+# Benefits:
+# - Lower memory footprint (~450KB vs 40MB for CW Agent)
+# - Near real-time log delivery (2-5 second latency)
+# - More efficient batching and compression
+# - Better performance under high log volume
+# ============================================================================
+
+echo "[*] Install Fluent Bit…"
+# Add Fluent Bit GPG key and repository
+curl -fsSL https://packages.fluentbit.io/fluentbit.key | gpg --dearmor -o /usr/share/keyrings/fluentbit-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/fluentbit-keyring.gpg] https://packages.fluentbit.io/ubuntu/$(lsb_release -cs) $(lsb_release -cs) main" \
+  | tee /etc/apt/sources.list.d/fluent-bit.list
+
+apt-get update -y
+apt-get install -y fluent-bit
+
+# Discover AWS region via IMDSv2 for Fluent Bit configuration
 TOKEN=$(curl -fsSL -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 REGION=$(curl -fsSL -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+INSTANCE_ID=$(curl -fsSL -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 
-echo "[*] Write CloudWatch Agent config…"
-cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
-{
-  "logs": {
-    "logs_collected": {
-      "files": {
-        "collect_list": [
-          { "file_path": "/var/log/gha/bootstrap.log",       "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/bootstrap" },
-          { "file_path": "/var/log/gha/runner.log",          "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/runner" },
-          { "file_path": "/var/log/cloud-init-output.log",   "log_group_name": "${cw_log_group}", "log_stream_name": "{instance_id}/cloud-init" }
-        ]
-      }
-    },
-    "force_flush_interval": 5
-  },
-  "agent": { "region": "$${REGION}", "debug": false }
-}
-CWCFG
+echo "[*] Configure Fluent Bit for CloudWatch Logs…"
+# Main Fluent Bit configuration
+# Documentation: https://docs.fluentbit.io/manual/
+cat > /etc/fluent-bit/fluent-bit.conf <<FLUENTCONF
+# ============================================================================
+# SERVICE Configuration
+# ============================================================================
+# Global service configuration for Fluent Bit
+# - Flush: How often (seconds) to flush records to output (lower = faster delivery)
+# - Log_Level: info, warn, error, debug (use 'info' for production)
+# - Parsers_File: Custom parsers for log format detection
+# ============================================================================
+[SERVICE]
+    Flush        2
+    Daemon       Off
+    Log_Level    info
+    Parsers_File parsers.conf
+
+# ============================================================================
+# INPUT: Bootstrap Log
+# ============================================================================
+# Monitors the bootstrap.log file created during instance initialization
+# - Name: tail = monitor file for new lines
+# - Path: Absolute path to log file
+# - Tag: Identifier for routing logs to correct output
+# - Refresh_Interval: How often (seconds) to check for new data
+# - Read_from_Head: true = read entire file, false = only new lines
+# - Skip_Long_Lines: Prevent crashes on extremely long log lines
+# ============================================================================
+[INPUT]
+    Name              tail
+    Tag               gha.bootstrap
+    Path              /var/log/gha/bootstrap.log
+    Refresh_Interval  1
+    Read_from_Head    true
+    Skip_Long_Lines   On
+    Buffer_Max_Size   32k
+
+# ============================================================================
+# INPUT: Runner Log
+# ============================================================================
+# Monitors the runner.log file containing GitHub Actions runner output
+# This is typically the highest-volume log and most important for debugging
+# ============================================================================
+[INPUT]
+    Name              tail
+    Tag               gha.runner
+    Path              /var/log/gha/runner.log
+    Refresh_Interval  1
+    Read_from_Head    false
+    Skip_Long_Lines   On
+    Buffer_Max_Size   32k
+
+# ============================================================================
+# INPUT: Service Log
+# ============================================================================
+# Monitors the systemd service log for the runner service
+# Captures startup, restart, and service-level errors
+# ============================================================================
+[INPUT]
+    Name              tail
+    Tag               gha.service
+    Path              /var/log/gha/gha-runner.service.log
+    Refresh_Interval  1
+    Read_from_Head    false
+    Skip_Long_Lines   On
+    Buffer_Max_Size   32k
+
+# ============================================================================
+# INPUT: Cloud-Init Log
+# ============================================================================
+# Monitors cloud-init output for EC2 instance initialization debugging
+# Useful for troubleshooting user-data script failures
+# ============================================================================
+[INPUT]
+    Name              tail
+    Tag               gha.cloudinit
+    Path              /var/log/cloud-init-output.log
+    Refresh_Interval  1
+    Read_from_Head    true
+    Skip_Long_Lines   On
+    Buffer_Max_Size   32k
+
+# ============================================================================
+# OUTPUT: CloudWatch Logs
+# ============================================================================
+# Ships all logs to AWS CloudWatch Logs
+# - Name: cloudwatch_logs = use CloudWatch Logs output plugin
+# - Match: * = send all tags to CloudWatch (could be 'gha.*' for specific logs)
+# - region: AWS region (auto-detected via IMDSv2)
+# - log_group_name: CloudWatch Log Group (must exist or auto_create_group=On)
+# - log_stream_prefix: Prefix for log streams (full name: prefix + tag)
+# - auto_create_group: Automatically create log group if it doesn't exist
+# - log_retention_days: How long to retain logs (0 = never expire)
+# - role_arn: Optional - use specific IAM role instead of instance profile
+# 
+# Performance tuning:
+# - workers: Number of parallel workers (increase for high volume)
+# - log_key: Field to use as log message (default: 'log')
+# ============================================================================
+[OUTPUT]
+    Name                         cloudwatch_logs
+    Match                        *
+    region                       $${REGION}
+    log_group_name               ${cw_log_group}
+    log_stream_prefix            $${INSTANCE_ID}/
+    auto_create_group            On
+    log_retention_days           7
+    workers                      1
+
+# ============================================================================
+# Alternative OUTPUT: Local debugging
+# ============================================================================
+# Uncomment this section to output logs to stdout for debugging
+# Useful during development or troubleshooting Fluent Bit configuration
+# ============================================================================
+# [OUTPUT]
+#     Name   stdout
+#     Match  *
+#     Format json_lines
+FLUENTCONF
+
+echo "[*] Create Fluent Bit parsers configuration…"
+# Custom parsers for common log formats
+# Add custom parsers here if your logs have specific formats
+cat > /etc/fluent-bit/parsers.conf <<PARSERS
+# ============================================================================
+# PARSERS Configuration
+# ============================================================================
+# Custom parsers for structured log formats
+# Documentation: https://docs.fluentbit.io/manual/pipeline/parsers
+# 
+# Common parser types:
+# - regex: Use regex patterns to extract fields
+# - json: Parse JSON-formatted logs
+# - logfmt: Parse logfmt style logs (key=value)
+# ============================================================================
+
+# Example: Parse timestamped log lines
+# Format: [2024-11-02 10:30:45] Message text
+[PARSER]
+    Name        timestamped
+    Format      regex
+    Regex       ^\[(?<time>[^\]]+)\]\s+(?<message>.*)$
+    Time_Key    time
+    Time_Format %Y-%m-%d %H:%M:%S
+
+# Example: Parse JSON logs
+[PARSER]
+    Name        json
+    Format      json
+    Time_Key    timestamp
+    Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+PARSERS
+
+echo "[*] Set Fluent Bit permissions…"
+# Ensure Fluent Bit can read log files
+usermod -aG ubuntu fluent-bit || true
+chown -R fluent-bit:fluent-bit /var/log/gha/
+chmod 644 /var/log/gha/*.log 2>/dev/null || true
+
+echo "[*] Enable & start Fluent Bit service…"
+systemctl daemon-reload
+systemctl enable fluent-bit
+systemctl start fluent-bit
+
+# Verify Fluent Bit is running
+if systemctl is-active --quiet fluent-bit; then
+  echo "[✓] Fluent Bit is running and shipping logs to CloudWatch"
+  echo "    Log Group: ${cw_log_group}"
+  echo "    Log Streams: $${INSTANCE_ID}/gha.bootstrap, $${INSTANCE_ID}/gha.runner, etc."
+  echo "    Expected latency: 2-5 seconds"
+else
+  echo "[!] Warning: Fluent Bit failed to start. Check logs with:"
+  echo "    sudo journalctl -u fluent-bit -n 50"
+fi
 
 echo "[*] Enable & start services…"
 systemctl daemon-reload

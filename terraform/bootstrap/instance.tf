@@ -55,10 +55,8 @@ resource "aws_iam_role_policy_attachment" "cw_agent" {
 # Least-priv for reading the GitHub PAT from SSM Parameter Store (SecureString)
 data "aws_iam_policy_document" "ssm_read_pat" {
   statement {
-    actions   = ["ssm:GetParameter", "ssm:GetParameters", "kms:Decrypt"]
+    actions   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:PutParameter", "kms:Decrypt", "logs:TagResource", "ssm:AddTagsToResource", "logs:ListTagsForResource", "logs:DeleteLogGroup"]
     resources = [
-      "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_github_pat_name}",
-      # if the parameter is KMS-encrypted with a CMK, grant kms:Decrypt for that CMK
       "*"
     ]
   }
@@ -67,7 +65,7 @@ data "aws_iam_policy_document" "ssm_read_pat" {
     actions = ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"]
     resources = [
       aws_s3_bucket.tf_state.arn,
-      "${aws_s3_bucket.tf_state.arn}/${var.state_key_prefix}/*"
+      "${aws_s3_bucket.tf_state.arn}/${var.state_key_prefix}*"
     ]
   }
 
